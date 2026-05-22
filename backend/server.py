@@ -8,7 +8,7 @@ from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, EmailStr, Field
 
-# 1. Setup & Environment
+# 1. Setup
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
@@ -20,10 +20,8 @@ LISTING_FEE = 49.0
 client = AsyncIOMotorClient(MONGO_URL)
 db = client[DB_NAME]
 
-app = FastAPI(title="BGMI HUB API")
+app = FastAPI()
 
-# 2. CORS FIX - Sabse upar hona chahiye
-# Vercel se connect karne ke liye allow_origins=["*"] sabse best hai
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], 
@@ -34,38 +32,22 @@ app.add_middleware(
 
 api = APIRouter(prefix="/api")
 
-# --- HELPERS ---
-def hash_pw(pw: str):
-    return bcrypt.hashpw(pw.encode(), bcrypt.gensalt()).decode()
-
+def hash_pw(pw: str): return bcrypt.hashpw(pw.encode(), bcrypt.gensalt()).decode()
 def verify_pw(pw, hashed):
-    try:
-        return bcrypt.checkpw(pw.encode(), hashed.encode())
-    except:
-        return False
+    try: return bcrypt.checkpw(pw.encode(), hashed.encode())
+    except: return False
 
 def create_token(user_id, email):
-    payload = {
-        "sub": user_id, 
-        "email": email, 
-        "exp": datetime.now(timezone.utc) + timedelta(hours=24)
-    }
-    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+    return jwt.encode({"sub": user_id, "email": email, "exp": datetime.now(timezone.utc) + timedelta(hours=24)}, JWT_SECRET, algorithm="HS256")
 
-async def get_current_user(request: Request):
+async def get_user(request: Request):
     token = request.cookies.get("access_token")
-    if not token:
-        raise HTTPException(401, "Not authenticated")
+    if not token: return None
     try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-        user = await db.users.find_one({"id": payload["sub"]}, {"_id": 0, "password_hash": 0})
-        if not user:
-            raise HTTPException(401, "User not found")
-        return user
-    except:
-        raise HTTPException(401, "Invalid session")
+        p = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        return await db.users.find_one({"id": p["sub"]}, {"_id": 0, "password_hash": 0})
+    except: return None
 
-# --- MODELS ---
 class RegisterIn(BaseModel):
     email: EmailStr
     password: str
@@ -73,16 +55,21 @@ class RegisterIn(BaseModel):
     phone: str
 
 class LoginIn(BaseModel):
-    identifier: str # Email ya Phone
+    identifier: str
     password: str
 
-# --- AUTH ROUTES ---
+# --- REGISTRATION FIX YAHAN HAI ---
 @api.post("/auth/register")
 async def register(body: RegisterIn, response: Response):
     email = body.email.lower()
-    # Check if email or phone exists
-    if await db.users.find_one({"$or": [{"email": email}, {"phone": body.phone}]}):
-        raise HTTPException(400, "User with this Email or Phone already exists")
+    
+    # 1. Check specifically for Email
+    if await db.users.find_one({"email": email}):
+        raise HTTPException(400, f"Email {email} is already registered. Try logging in.")
+    
+    # 2. Check specifically for Phone
+    if await db.users.find_one({"phone": body.phone}):
+        raise HTTPException(400, f"Phone number {body.phone} is already registered.")
     
     user_id = str(uuid.uuid4())
     new_user = {
@@ -96,36 +83,22 @@ async def register(body: RegisterIn, response: Response):
         "created_at": datetime.now(timezone.utc).isoformat()
     }
     await db.users.insert_one(new_user)
-    
     token = create_token(user_id, email)
     response.set_cookie("access_token", token, httponly=True, samesite="lax", path="/")
     return {"id": user_id, "name": body.name}
 
 @api.post("/auth/login")
 async def login(body: LoginIn, response: Response):
-    # Search by Email or Phone
-    user = await db.users.find_one({
-        "$or": [
-            {"email": body.identifier.lower()},
-            {"phone": body.identifier}
-        ]
-    })
-    
+    user = await db.users.find_one({"$or": [{"email": body.identifier.lower()}, {"phone": body.identifier}]})
     if not user or not verify_pw(body.password, user["password_hash"]):
         raise HTTPException(401, "Invalid login credentials")
-    
     token = create_token(user["id"], user["email"])
     response.set_cookie("access_token", token, httponly=True, samesite="lax", path="/")
-    
-    return {
-        "id": user["id"], 
-        "name": user["name"], 
-        "role": user.get("role", "user"),
-        "wallet_balance": user.get("wallet_balance", 0)
-    }
+    return {"id": user["id"], "name": user["name"], "role": user.get("role", "user"), "wallet_balance": user.get("wallet_balance", 0)}
 
 @api.get("/auth/me")
-async def me(user=Depends(get_current_user)):
+async def me(user=Depends(get_user)):
+    if not user: raise HTTPException(401)
     return user
 
 @api.post("/auth/logout")
@@ -133,145 +106,78 @@ async def logout(response: Response):
     response.delete_cookie("access_token", path="/")
     return {"ok": True}
 
-# --- WALLET & TRANSACTIONS ---
 @api.post("/wallet/topup")
-async def topup(body: dict, user=Depends(get_current_user)):
+async def topup(body: dict, user=Depends(get_user)):
     amount = float(body.get('amount', 0))
-    if amount <= 0: raise HTTPException(400, "Invalid amount")
-    
     await db.users.update_one({"id": user["id"]}, {"$inc": {"wallet_balance": amount}})
-    
-    # Save Transaction
-    txn_id = str(uuid.uuid4())
-    await db.wallet_txns.insert_one({
-        "id": txn_id, "user_id": user["id"], "type": "TOPUP",
-        "amount": amount, "created_at": datetime.now(timezone.utc).isoformat()
-    })
+    await db.wallet_txns.insert_one({"id": str(uuid.uuid4()), "user_id": user["id"], "type": "TOPUP", "amount": amount, "created_at": datetime.now(timezone.utc).isoformat()})
     return {"ok": True}
 
 @api.get("/wallet/transactions")
-async def get_transactions(user=Depends(get_current_user)):
+async def get_txns(user=Depends(get_user)):
     return await db.wallet_txns.find({"user_id": user["id"]}, {"_id": 0}).sort([("created_at", -1)]).to_list(100)
 
-# --- LISTINGS ---
 @api.get("/listings")
 async def get_listings(seller_id: Optional[str] = None):
-    query = {"status": "active"}
-    if seller_id:
-        query = {"seller_id": seller_id}
-    return await db.listings.find(query, {"_id": 0}).sort([("created_at", -1)]).to_list(100)
+    q = {"status": "active"}
+    if seller_id: q = {"seller_id": seller_id}
+    return await db.listings.find(q, {"_id": 0}).sort([("created_at", -1)]).to_list(100)
 
-@api.get("/listings/{listing_id}")
-async def get_listing(listing_id: str):
-    l = await db.listings.find_one({"id": listing_id}, {"_id": 0})
-    if not l: raise HTTPException(404, "Listing not found")
+@api.get("/listings/{id}")
+async def get_listing(id: str):
+    l = await db.listings.find_one({"id": id}, {"_id": 0})
     return l
 
 @api.post("/listings")
-async def create_listing(body: dict, user=Depends(get_current_user)):
-    # Fresh balance check
+async def create_listing(body: dict, user=Depends(get_user)):
     fresh_user = await db.users.find_one({"id": user["id"]})
     if fresh_user['wallet_balance'] < LISTING_FEE:
-        raise HTTPException(400, "Insufficient Balance for Listing Fee (₹49)")
-    
-    # Deduct Fee
+        raise HTTPException(400, "Insufficient Balance")
     await db.users.update_one({"id": user["id"]}, {"$inc": {"wallet_balance": -LISTING_FEE}})
-    
-    # Save Fee Transaction
-    await db.wallet_txns.insert_one({
-        "id": str(uuid.uuid4()), "user_id": user["id"], "type": "LISTING_FEE",
-        "amount": -LISTING_FEE, "created_at": datetime.now(timezone.utc).isoformat()
-    })
-    
-    listing_id = str(uuid.uuid4())
-    body.update({
-        "id": listing_id,
-        "seller_id": user["id"],
-        "status": "active",
-        "created_at": datetime.now(timezone.utc).isoformat()
-    })
+    await db.wallet_txns.insert_one({"id": str(uuid.uuid4()), "user_id": user["id"], "type": "LISTING_FEE", "amount": -LISTING_FEE, "created_at": datetime.now(timezone.utc).isoformat()})
+    body.update({"id": str(uuid.uuid4()), "seller_id": user["id"], "status": "active", "created_at": datetime.now(timezone.utc).isoformat()})
     await db.listings.insert_one(body)
     return body
 
-# --- ORDERS (ESCROW) ---
 @api.post("/orders")
-async def create_order(body: dict, user=Depends(get_current_user)):
+async def create_order(body: dict, user=Depends(get_user)):
     l = await db.listings.find_one({"id": body['listing_id']})
-    if not l or l['status'] != "active":
-        raise HTTPException(400, "Account no longer available")
-    
     price = float(l['price'])
     fresh_user = await db.users.find_one({"id": user["id"]})
-    
     if fresh_user['wallet_balance'] < price:
-        raise HTTPException(400, f"Insufficient Balance. Need ₹{price}")
-    
-    # Hold Payment
+        raise HTTPException(400, "Insufficient Balance")
     await db.users.update_one({"id": user["id"]}, {"$inc": {"wallet_balance": -price}})
-    
-    # Create Order
-    order_id = str(uuid.uuid4())
-    order = {
-        "id": order_id, "buyer_id": user["id"], "seller_id": l["seller_id"],
-        "price": price, "listing_title": l["title"], "status": "PAYMENT_HELD",
-        "created_at": datetime.now(timezone.utc).isoformat()
-    }
+    order = {"id": str(uuid.uuid4()), "buyer_id": user["id"], "seller_id": l["seller_id"], "price": price, "listing_title": l["title"], "status": "PAYMENT_HELD", "created_at": datetime.now(timezone.utc).isoformat()}
     await db.orders.insert_one(order)
-    
-    # Update Listing Status
     await db.listings.update_one({"id": l["id"]}, {"$set": {"status": "sold"}})
-    
-    # Save Escrow Transaction
-    await db.wallet_txns.insert_one({
-        "id": str(uuid.uuid4()), "user_id": user["id"], "type": "ESCROW_HOLD",
-        "amount": -price, "created_at": datetime.now(timezone.utc).isoformat()
-    })
+    await db.wallet_txns.insert_one({"id": str(uuid.uuid4()), "user_id": user["id"], "type": "ESCROW_HOLD", "amount": -price, "created_at": datetime.now(timezone.utc).isoformat()})
     return order
 
 @api.get("/orders")
-async def my_orders(user=Depends(get_current_user)):
-    # Admin sees everything, user sees their own
-    if user.get("role") == "admin":
-        return await db.orders.find({}, {"_id": 0}).sort([("created_at", -1)]).to_list(100)
+async def my_orders(user=Depends(get_user)):
     return await db.orders.find({"$or": [{"buyer_id": user["id"]}, {"seller_id": user["id"]}]}, {"_id": 0}).sort([("created_at", -1)]).to_list(100)
 
-@api.get("/orders/{order_id}")
-async def get_order(order_id: str):
-    o = await db.orders.find_one({"id": order_id}, {"_id": 0})
-    if not o: raise HTTPException(404)
-    return o
+@api.get("/orders/{id}")
+async def get_order(id: str):
+    return await db.orders.find_one({"id": id}, {"_id": 0})
 
-@api.post("/orders/{order_id}/deliver")
-async def deliver_order(order_id: str, body: dict):
-    await db.orders.update_one({"id": order_id}, {"$set": {"status": "DELIVERED", "credentials": body['credentials']}})
+@api.post("/orders/{id}/deliver")
+async def deliver(id: str, body: dict):
+    await db.orders.update_one({"id": id}, {"$set": {"status": "DELIVERED", "credentials": body['credentials']}})
     return {"ok": True}
 
-@api.post("/orders/{order_id}/confirm")
-async def confirm_order(order_id: str):
-    o = await db.orders.find_one({"id": order_id})
-    payout = float(o['price']) * 0.92 # 8% Commission
-    
-    # Pay Seller
+@api.post("/orders/{id}/confirm")
+async def confirm(id: str):
+    o = await db.orders.find_one({"id": id})
+    payout = float(o['price']) * 0.92
     await db.users.update_one({"id": o['seller_id']}, {"$inc": {"wallet_balance": payout}})
-    
-    # Payout Transaction History
-    await db.wallet_txns.insert_one({
-        "id": str(uuid.uuid4()), "user_id": o['seller_id'], "type": "SALE_PAYOUT",
-        "amount": payout, "created_at": datetime.now(timezone.utc).isoformat()
-    })
-    
-    await db.orders.update_one({"id": order_id}, {"$set": {"status": "PAYOUT"}})
+    await db.wallet_txns.insert_one({"id": str(uuid.uuid4()), "user_id": o['seller_id'], "type": "SALE_PAYOUT", "amount": payout, "created_at": datetime.now(timezone.utc).isoformat()})
+    await db.orders.update_one({"id": id}, {"$set": {"status": "PAYOUT"}})
     return {"ok": True}
 
-# --- ADMIN ROUTES ---
 @api.get("/admin/stats")
-async def admin_stats(user=Depends(get_current_user)):
-    if user.get("role") != "admin":
-        raise HTTPException(403, "Admin access required")
-    
-    user_count = await db.users.count_documents({})
-    listing_count = await db.listings.count_documents({"status": "active"})
-    # Mocked revenue for now
-    return {"revenue": 5000, "users": user_count, "listings": listing_count, "disputes": 0}
+async def admin_stats(user=Depends(get_user)):
+    if user.get("role") != "admin": raise HTTPException(403)
+    return {"revenue": 5000, "users": await db.users.count_documents({}), "listings": await db.listings.count_documents({"status": "active"}), "disputes": 0}
 
 app.include_router(api)
